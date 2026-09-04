@@ -85,8 +85,10 @@ def test_mtp_forward_runs_on_the_virtual_qsa_layer():
             tensor.zero_()
         elif tensor.dtype == torch.float8_e4m3fn or name.endswith("_global"):
             tensor.fill_(1)
-        else:
+        elif tensor.is_floating_point():
             tensor.normal_(0, 0.02)
+        else:
+            tensor.zero_()
 
     req = fixture.req(table_idx=0, cached_len=0, device_len=3)
     batch = fixture.batch([req], "prefill")
@@ -97,3 +99,92 @@ def test_mtp_forward_runs_on_the_virtual_qsa_layer():
     assert output.shape == (3, config.hidden_size)
     assert hidden.shape == previous.shape
     assert torch.isfinite(output).all()
+
+
+@requires_cuda
+def test_mtp_engine_prefill_and_speculative_round():
+    from types import SimpleNamespace
+
+    from freetoken.core import Batch, Req, SamplingParams
+    from freetoken.engine.engine import Engine
+    from freetoken.engine.sample import BatchSamplingArgs, Sampler
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.models.qwen4_exp.ple import GpuResidentTable
+    from freetoken.moe.fused import FusedMoe
+
+    from .common import hash_constants
+
+    config = enable_mtp(parsed_config(mtp_num_hidden_layers=1), 3)
+    fixture = Fixture(config, num_pages=8, max_running_req=2)
+    fixture.ctx.moe_backend = FusedMoe()
+    fixture.ctx.linear_state_pool = LinearStatePool(
+        config.linear_attention_group(),
+        3,
+        torch.bfloat16,
+        torch.device("cuda"),
+        slot_states=config.slot_states,
+    )
+    with torch.device("cuda"), torch_dtype(torch.bfloat16):
+        model = Qwen4ExpForCausalLM(config)
+    for name, tensor in model.state_dict().items():
+        if tensor.dtype == torch.uint8:
+            tensor.zero_()
+        elif tensor.dtype == torch.float8_e4m3fn or name.endswith("_global"):
+            tensor.fill_(1)
+        elif tensor.is_floating_point():
+            tensor.normal_(0, 0.02)
+        else:
+            tensor.zero_()
+    multipliers, sizes, offsets = hash_constants(config.qwen4_args)
+    table = torch.randn(
+        4096,
+        config.qwen4_args.ngram_head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    for ple in model.model.ple_layers:
+        ple.ple_embedding.layer_multipliers.copy_(multipliers)
+        ple.ple_embedding.ngram_heads_vocab_sizes.copy_(sizes)
+        ple.ple_embedding.ngram_heads_offsets.copy_(offsets)
+        ple.ple_embedding.attach_table(GpuResidentTable(table))
+
+    engine = object.__new__(Engine)
+    engine.config = SimpleNamespace(model_config=config)
+    engine.device = torch.device("cuda")
+    engine.model = model
+    engine.ctx = fixture.ctx
+    engine.attn_backend = fixture.backend
+    engine.kv_cache = fixture.pool
+    engine.linear_state_pool = fixture.ctx.linear_state_pool
+    engine.sampler = Sampler(engine.device, config.vocab_size)
+    engine.stream = torch.cuda.current_stream()
+
+    prompt = torch.tensor([3, 4, 5, 6], dtype=torch.int32)
+    req = Req(prompt, 1, 0, 8, 1, SamplingParams(), None)
+    fixture.allocate(req.table_idx, req.cached_len, req.device_len)
+    prefill = Batch([req], "prefill")
+    prefill.padded_reqs = prefill.reqs
+    prefill.input_ids = prompt.to("cuda")
+    prefill.positions = torch.arange(4, device="cuda", dtype=torch.int32)
+    prefill.out_loc = fixture.page_table[req.table_idx, :4]
+    fixture.backend.prepare_metadata(prefill)
+
+    first = engine._forward_mtp_prefill(prefill, BatchSamplingArgs(None))
+    first.copy_done_event.synchronize()
+    req.append_host(first.next_tokens_cpu)
+    assert req.mtp_hidden is not None and req.mtp_draft is not None
+
+    depth = 3
+    positions = torch.arange(req.cached_len, req.cached_len + depth + 1, device="cuda")
+    verify = Batch([req], "decode")
+    verify.padded_reqs = verify.reqs
+    verify.speculative = True
+    verify.speculative_depth = depth
+    verify.positions = positions.to(torch.int32)
+    verify.out_loc = fixture.page_table[req.table_idx, positions]
+    verify.input_ids = torch.zeros(depth + 1, dtype=torch.int32, device="cuda")
+    verify.input_ids[0] = first.next_tokens_gpu[0]
+    result = engine._forward_mtp_round(verify)
+    result.copy_done_event.synchronize()
+    assert 1 <= result.next_tokens_cpu.numel() <= depth + 1
+    assert req.device_len == req.cached_len + 1

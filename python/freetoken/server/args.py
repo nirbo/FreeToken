@@ -378,6 +378,15 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--speculative-tokens",
+        type=int,
+        choices=range(6),
+        default=ServerArgs.speculative_tokens,
+        metavar="N",
+        help="Enable the model's attached MTP drafter with N draft tokens (1-5; 0 disables).",
+    )
+
+    parser.add_argument(
         "--model-source",
         type=str,
         default="huggingface",

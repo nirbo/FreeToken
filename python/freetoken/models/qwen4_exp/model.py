@@ -222,11 +222,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         batch = get_global_ctx().batch
         return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
 
-    def forward_target_with_hidden(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward_target_with_hidden(
+        self, *, all_logits: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Target logits plus the pre-final-mixer streams consumed by MTP."""
         batch = get_global_ctx().batch
         output, hidden = self.model.forward(batch.input_ids, batch, return_multistream=True)
-        return self.lm_head.forward(output), hidden
+        logits = self.lm_head.forward_all(output) if all_logits else self.lm_head.forward(output)
+        return logits, hidden
 
     def forward_mtp(
         self, input_ids: torch.Tensor, previous_hidden: torch.Tensor

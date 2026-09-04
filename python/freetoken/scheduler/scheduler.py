@@ -47,6 +47,10 @@ def _gib(n_bytes: int) -> str:
     return f"{n_bytes / (1 << 30):.2f} GiB"
 
 
+def _speculative_depth(req: Req, configured: int) -> int:
+    return min(configured, max(req.remain_len - 1, 0)) if req.sampling_params.is_greedy else 0
+
+
 # For overlap scheduling, we also need to cache some other data to avoid IMA
 class ForwardInput(NamedTuple):
     batch: Batch
@@ -283,7 +287,7 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self.config.model_config.num_speculative_tokens:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -334,42 +338,49 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
+                tokens = next_tokens_cpu if batch.speculative else next_tokens_cpu[i : i + 1]
+                finished = False
+                for next_token_tensor in tokens:
+                    req.append_host(next_token_tensor.unsqueeze(0))
+                    next_token = int(next_token_tensor.item())
+                    # Host length is the committed output frontier; unlike device_len it is
+                    # not advanced by an overlapped future forward.
+                    hit_length = len(req.input_ids) >= req.max_device_len
+                    hit_eos = (
+                        not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                     )
-                )
+                    matched_stop = (
+                        self._match_stop_str(req)
+                        if not hit_eos and req.sampling_params.stop_strs
+                        else None
+                    )
+                    finished = hit_length or hit_eos or matched_stop is not None
+                    finish_reason = (
+                        ("stop" if (hit_eos or matched_stop is not None) else "length")
+                        if finished
+                        else None
+                    )
+                    if (
+                        next_token == self.toolcall_anchor_id
+                        and req.toolcall_anchor_len is None
+                        and not finished
+                    ):
+                        req.toolcall_anchor_len = req.input_ids.numel()
+                    reply.append(
+                        DetokenizeMsg(
+                            uid=req.uid,
+                            next_token=next_token,
+                            finished=finished,
+                            finish_reason=finish_reason,
+                            matched_stop=matched_stop,
+                            stop_strs=req.sampling_params.stop_strs or None,
+                        )
+                    )
+                    if finished:
+                        if batch.speculative:
+                            req.device_len = len(req.input_ids)
+                            req.cached_len = min(req.cached_len, req.device_len)
+                        break
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -775,6 +786,43 @@ class Scheduler(SchedulerIOMixin):
             # this chunk, so a chunked prompt longer than the swa pool never accumulates its
             # whole swa footprint (which would exhaust alloc_swa). No-op unless SWA/paged.
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
+        depth = (
+            _speculative_depth(
+                batch.reqs[0], self.config.model_config.num_speculative_tokens
+            )
+            if (
+                batch.is_decode
+                and self.config.model_config.num_speculative_tokens
+            )
+            else 0
+        )
+        if depth:
+            req = batch.reqs[0]
+            original_device_len = req.device_len
+            req.device_len = req.cached_len + depth + 1
+            try:
+                self.cache_manager.allocate_paged(batch.reqs)
+            finally:
+                req.device_len = original_device_len
+            batch.speculative = True
+            batch.speculative_depth = depth
+            batch.speculative_output_start = original_device_len
+            batch.positions = torch.arange(
+                req.cached_len,
+                req.cached_len + depth + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            rows = torch.full_like(batch.positions, req.table_idx, dtype=torch.int64)
+            input_mapping = (rows, batch.positions.to(torch.int64))
+            batch.out_loc = self.engine.page_table[input_mapping]
+            return ForwardInput(
+                batch=batch,
+                sample_args=self.engine.sampler.prepare(batch),
+                input_tuple=input_mapping,
+                write_tuple=_make_write_tuple(batch, self.device),
+            )
+
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
         self.cache_manager.allocate_paged(batch.reqs)
@@ -869,7 +917,14 @@ class Scheduler(SchedulerIOMixin):
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if batch.speculative:
+            req = batch.reqs[0]
+            end = batch.speculative_output_start + forward_output.next_tokens_gpu.numel()
+            self.token_pool[
+                req.table_idx, batch.speculative_output_start : end
+            ] = forward_output.next_tokens_gpu
+        else:
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 

@@ -64,6 +64,10 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # Attached-MTP continuation after the drafter has consumed the current anchor.
+    mtp_hidden: torch.Tensor | None = None
+    mtp_draft: torch.Tensor | None = None
+    mtp_next_input_id: int | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -146,6 +150,10 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    speculative: bool = field(default=False, init=False)
+    speculative_depth: int = field(default=0, init=False)
+    speculative_output_start: int = field(default=0, init=False)
+    generated_tokens: int = field(default=0, init=False)
 
     @property
     def is_prefill(self) -> bool:

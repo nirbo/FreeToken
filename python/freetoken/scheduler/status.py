@@ -103,7 +103,7 @@ class SchedulerStatusReporter:
         swa_tokens: tuple[int, int] | None = None,
     ) -> None:
         self._decode_forward_count += 1
-        self._decode_generated_tokens += len(batch.reqs)
+        self._decode_generated_tokens += getattr(batch, "generated_tokens", 0) or len(batch.reqs)
         if self._decode_forward_count % self.decode_log_interval != 0:
             return
 

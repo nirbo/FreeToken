@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+from copy import copy
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -29,6 +30,17 @@ from freetoken.kvcache.linear_state_pool import (
 )
 
 logger = init_logger(__name__)
+
+
+def _greedy_accept(
+    target_tokens: torch.Tensor, draft_ids: torch.Tensor
+) -> tuple[int, torch.Tensor]:
+    """Return accepted draft count and accepted-prefix-plus-correction tokens."""
+    rejected = torch.nonzero(target_tokens[:-1] != draft_ids, as_tuple=False)
+    accepted = draft_ids.numel() if rejected.numel() == 0 else int(rejected[0].item())
+    return accepted, torch.cat(
+        (draft_ids[:accepted], target_tokens[accepted : accepted + 1])
+    )
 
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
@@ -924,6 +936,12 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if self.config.model_config.num_speculative_tokens and args.temperatures is None:
+            if batch.speculative:
+                return self._forward_mtp_round(batch)
+            if batch.is_prefill:
+                return self._forward_mtp_prefill(batch, args)
+            return self._forward_mtp_final(batch, args)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
@@ -941,6 +959,186 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _mtp_batch(
+        self,
+        req: Req,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        out_loc: torch.Tensor,
+        *,
+        cached_len: int,
+        phase: str,
+    ) -> Batch:
+        proxy = copy(req)
+        proxy.cached_len = cached_len
+        proxy.device_len = cached_len + input_ids.numel()
+        batch = Batch(reqs=[proxy], phase=phase)  # type: ignore[arg-type]
+        batch.padded_reqs = batch.reqs
+        batch.input_ids = input_ids
+        batch.positions = positions
+        batch.out_loc = out_loc
+        self.attn_backend.prepare_metadata(batch)
+        return batch
+
+    def _mtp_forward(self, batch: Batch, previous_hidden: torch.Tensor):
+        with self.ctx.forward_batch(batch):
+            return self.model.forward_mtp(batch.input_ids, previous_hidden)
+
+    def _target_forward(self, batch: Batch, *, all_logits: bool):
+        from freetoken.attention.linear import build_fla_metadata
+
+        if self.linear_state_pool is not None:
+            batch.fla_metadata = build_fla_metadata(batch, self.device)
+        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, False):
+            return self.model.forward_target_with_hidden(all_logits=all_logits)
+
+    def _forward_output(self, tokens: torch.Tensor) -> ForwardOutput:
+        tokens = tokens.to(torch.int32)
+        tokens_cpu = tokens.to("cpu", non_blocking=True)
+        done = torch.cuda.Event()
+        done.record(self.stream)
+        return ForwardOutput(tokens, tokens_cpu, done)
+
+    def _forward_mtp_prefill(
+        self, batch: Batch, args: BatchSamplingArgs
+    ) -> ForwardOutput:
+        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, False):
+            logits, target_hidden = self.model.forward_target_with_hidden()
+        next_tokens = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+
+        # MTP prefill is shifted by one embedding while retaining target positions:
+        # hidden[p] is paired with token[p+1], and the final prompt column uses the
+        # newly sampled anchor.
+        req = batch.reqs[0]
+        tail = (
+            torch.tensor([req.mtp_next_input_id], dtype=torch.int32, device=self.device)
+            if req.mtp_next_input_id is not None
+            else next_tokens[:1]
+        )
+        shifted = torch.cat((batch.input_ids[1:], tail))
+        mtp_batch = self._mtp_batch(
+            req,
+            shifted,
+            batch.positions,
+            batch.out_loc,
+            cached_len=req.cached_len,
+            phase="prefill",
+        )
+        if req.mtp_next_input_id is None:
+            mtp_logits, mtp_hidden = self._mtp_forward(mtp_batch, target_hidden)
+            req.mtp_hidden = mtp_hidden[-1:]
+            req.mtp_draft = torch.argmax(mtp_logits[-1:], dim=-1).to(torch.int32)
+        else:
+            with self.ctx.forward_batch(mtp_batch):
+                self.model.mtp.forward(shifted, target_hidden, mtp_batch)
+
+        for item in batch.reqs:
+            item.complete_one()
+        return self._forward_output(next_tokens)
+
+    def _forward_mtp_final(
+        self, batch: Batch, args: BatchSamplingArgs
+    ) -> ForwardOutput:
+        """Consume the pending anchor when only one output-budget token remains."""
+        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, False):
+            logits = self.model.forward()
+        req = batch.reqs[0]
+        req.complete_one()
+        return self._forward_output(self.sampler.sample(logits[:1], args))
+
+    def _forward_mtp_round(self, batch: Batch) -> ForwardOutput:
+        req = batch.reqs[0]
+        depth = batch.speculative_depth
+        if req.mtp_hidden is None or req.mtp_draft is None:
+            raise RuntimeError("MTP decode started before prompt alignment completed")
+        base = req.cached_len
+        drafts = [req.mtp_draft]
+        hidden = req.mtp_hidden
+
+        # Finish the proposal that prompt/previous-round alignment seeded. These
+        # provisional MTP cache rows are overwritten by accepted target alignment.
+        index_layers = next(
+            group.num_index_layers
+            for group in self.config.model_config.attention_groups
+            if getattr(group, "name", "") == "full"
+        )
+        ring_before = torch.stack(
+            [
+                self.kv_cache.pending_ring(slot)[req.table_idx].clone()
+                for slot in range(index_layers)
+            ]
+        )
+        for step in range(1, depth):
+            pos = step - 1
+            mtp_batch = self._mtp_batch(
+                req,
+                drafts[-1],
+                batch.positions[pos : pos + 1],
+                batch.out_loc[pos : pos + 1],
+                cached_len=base + pos,
+                phase="decode",
+            )
+            mtp_logits, hidden = self._mtp_forward(mtp_batch, hidden)
+            drafts.append(torch.argmax(mtp_logits, dim=-1).to(torch.int32))
+        draft_ids = torch.cat(drafts)
+        verify_ids = torch.cat((batch.input_ids[:1], draft_ids))
+
+        target_batch = self._mtp_batch(
+            req,
+            verify_ids,
+            batch.positions[: depth + 1],
+            batch.out_loc[: depth + 1],
+            cached_len=base,
+            phase="prefill",
+        )
+        pool = self.linear_state_pool
+        live_slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+        rollback_slot = pool.num_slots - 1 if pool is not None else 0
+        if pool is not None:
+            pool.copy_from(live_slot, rollback_slot)
+        target_logits, target_hidden = self._target_forward(target_batch, all_logits=True)
+        target_tokens = torch.argmax(target_logits, dim=-1).to(torch.int32)
+        accepted, licensed = _greedy_accept(target_tokens, draft_ids)
+        correction = target_tokens[accepted : accepted + 1]
+
+        if accepted < depth:
+            if pool is not None:
+                pool.copy_from(rollback_slot, live_slot)
+            for slot in range(ring_before.shape[0] - 1):
+                self.kv_cache.pending_ring(slot)[req.table_idx].copy_(ring_before[slot])
+            replay = self._mtp_batch(
+                req,
+                verify_ids[: accepted + 1],
+                batch.positions[: accepted + 1],
+                batch.out_loc[: accepted + 1],
+                cached_len=base,
+                phase="prefill",
+            )
+            with self.ctx.forward_batch(replay), self.model.forward_host_ctx(replay, False):
+                self.model.model.forward(replay.input_ids, replay)
+
+        # Drop provisional drafter rows, then align only the licensed target path.
+        mtp_slot = ring_before.shape[0] - 1
+        self.kv_cache.pending_ring(mtp_slot)[req.table_idx].copy_(ring_before[mtp_slot])
+        align_ids = torch.cat((draft_ids[:accepted], correction))
+        align = self._mtp_batch(
+            req,
+            align_ids,
+            batch.positions[: accepted + 1],
+            batch.out_loc[: accepted + 1],
+            cached_len=base,
+            phase="prefill",
+        )
+        mtp_logits, mtp_hidden = self._mtp_forward(
+            align, target_hidden[: accepted + 1]
+        )
+        req.mtp_hidden = mtp_hidden[-1:]
+        req.mtp_draft = torch.argmax(mtp_logits[-1:], dim=-1).to(torch.int32)
+        req.cached_len = base + accepted + 1
+        req.device_len = req.cached_len + 1
+        batch.generated_tokens = accepted + 1
+        return self._forward_output(licensed)
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
@@ -1236,6 +1434,13 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
+
+    if getattr(model_config, "num_speculative_tokens", 0):
+        # ponytail: MTP starts single-request/eager/no-prefix; add batched graphs and
+        # continuation-hidden prefix entries only after the real workload needs them.
+        override("cache_type", "naive")
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
 
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family

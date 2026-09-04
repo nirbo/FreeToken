@@ -163,6 +163,20 @@ def test_pool_sizing_covers_4mr_floor():
         assert _linear_pool_num_slots(c) >= 4 * mr + 1, (mr, _linear_pool_num_slots(c))
 
 
+def test_single_stream_pool_honors_snapshot_ratio():
+    """A serialized MTP request needs its working set plus the requested cache ratio."""
+    from types import SimpleNamespace
+    from freetoken.kvcache.linear_state_pool import _linear_pool_num_slots
+
+    c = SimpleNamespace(
+        max_running_req=1,
+        cache_type="hybrid_radix",
+        linear_state_cache_ratio=2.0,
+        model_config=SimpleNamespace(single_stream_only=True),
+    )
+    assert _linear_pool_num_slots(c) == 7  # four live + two cached + padding
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

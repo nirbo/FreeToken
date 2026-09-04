@@ -214,7 +214,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         )
         row_source = nvfp4.packed if nvfp4 else resolve_row_source(folder)
         ple_bytes = nvfp4.nbytes if nvfp4 else row_source.total_rows * row_source.row_bytes
-        backend = engine_config.ple_backend
+        requested_backend = engine_config.ple_backend
+        backend = requested_backend
         if backend == "auto":
             from freetoken.moe.expert_banks import bank_bytes_estimate
             expert_bytes = bank_bytes_estimate(self._config) or 0
@@ -225,6 +226,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 f"experts {expert_bytes / 2**30:.1f} GiB"
             )
             logger.info_rank0(f"PLE auto: {detail} -> {backend}")
+        object.__setattr__(engine_config, "ple_backend", backend)
 
         def attach_disk() -> None:
             table_cls, source = ((Nvfp4DiskRowTable, nvfp4) if nvfp4
@@ -245,9 +247,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             try:
                 table = load_nvfp4_table(nvfp4)
             except (OSError, RuntimeError) as exc:
-                if engine_config.ple_backend != "auto":
+                if requested_backend != "auto":
                     raise
                 logger.warning_rank0(f"PLE RAM load failed ({exc}); falling back to disk")
+                object.__setattr__(engine_config, "ple_backend", "disk")
                 attach_disk()
                 return 0
             self._ple_table = table

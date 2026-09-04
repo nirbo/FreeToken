@@ -287,7 +287,12 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING or self.config.model_config.num_speculative_tokens:
+        # Disk PLE hashes Req.input_ids, which still trails the in-flight MTP reply here;
+        # pinned PLE hashes the device token/context state and can overlap safely.
+        if ENV.DISABLE_OVERLAP_SCHEDULING or (
+            self.config.model_config.num_speculative_tokens
+            and self.config.ple_backend != "pinned"
+        ):
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:

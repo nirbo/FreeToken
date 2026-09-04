@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VENV="${FREETOKEN_VENV:-/home/nir/venvs/freetoken-dev}"
 
+export PATH="$VENV/bin:$PATH"
 export PYTHONPATH="$ROOT/python"
 export HF_HOME="${HF_HOME:-/home/nir/venvs/.cache/huggingface}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/home/nir/venvs/.cache/triton}"

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fnmatch import fnmatch
 from typing import Any, Tuple
 
@@ -40,6 +40,7 @@ class Qwen4ExpArgs:
     index_head_dim: int
     index_budget: int
     index_ratio: int
+    mtp_num_hidden_layers: int = 0
 
     @property
     def index_topk_blocks(self) -> int:
@@ -251,6 +252,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_head_dim=int(text.indexer_head_dim),
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
+        mtp_num_hidden_layers=int(getattr(text, "mtp_num_hidden_layers", 0) or 0),
     )
 
     return ModelConfig(
@@ -290,4 +292,35 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["PLE_CONV_STATE", "PLE_NGRAM_STATE", "Qwen4ExpArgs", "parse_config", "ple_slot_states"]
+def enable_mtp(config: ModelConfig, draft_tokens: int) -> ModelConfig:
+    """Enable the attached MTP layer and add its virtual QSA layer to the cache geometry."""
+    if not 1 <= draft_tokens <= 5:
+        raise ValueError(f"Qwen3.8 MTP draft tokens must be in [1, 5], got {draft_tokens}")
+    if config.qwen4_args.mtp_num_hidden_layers != 1:
+        raise ValueError(
+            "Qwen3.8 MTP requires a checkpoint with mtp_num_hidden_layers=1"
+        )
+    virtual_layer = config.num_layers
+    groups = tuple(
+        replace(
+            group,
+            layer_ids=group.layer_ids + (virtual_layer,),
+            num_index_layers=group.num_index_layers + 1,
+        )
+        if isinstance(group, FullAttentionGroupConfig)
+        else group
+        for group in config.attention_groups
+    )
+    return replace(
+        config, attention_groups=groups, num_speculative_tokens=draft_tokens
+    )
+
+
+__all__ = [
+    "PLE_CONV_STATE",
+    "PLE_NGRAM_STATE",
+    "Qwen4ExpArgs",
+    "enable_mtp",
+    "parse_config",
+    "ple_slot_states",
+]

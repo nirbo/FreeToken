@@ -105,7 +105,9 @@ class Qwen4ExpModel(BaseOP):
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
 
-    def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, batch: Batch, *, return_multistream: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
         meta = None
         if self._ple:
@@ -120,7 +122,8 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
-        return self.hyper_connection_mixer.mix(hidden)[0]
+        output = self.hyper_connection_mixer.mix(hidden)[0]
+        return (output, hidden) if return_multistream else output
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
@@ -141,6 +144,12 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 tie_word_embeddings=config.tie_word_embeddings,
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
+        if config.num_speculative_tokens:
+            from .mtp import Qwen4ExpMTP
+
+            self.mtp = Qwen4ExpMTP(config, self.model.embed_tokens)
+        else:
+            self.mtp = None
         super().__init__()
 
     def load_host_tables(self, engine_config) -> int:
@@ -212,6 +221,20 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
         return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+
+    def forward_target_with_hidden(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Target logits plus the pre-final-mixer streams consumed by MTP."""
+        batch = get_global_ctx().batch
+        output, hidden = self.model.forward(batch.input_ids, batch, return_multistream=True)
+        return self.lm_head.forward(output), hidden
+
+    def forward_mtp(
+        self, input_ids: torch.Tensor, previous_hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one MTP alignment/proposal step and return logits plus its next streams."""
+        assert self.mtp is not None, "MTP is disabled"
+        output, hidden = self.mtp.forward(input_ids, previous_hidden, get_global_ctx().batch)
+        return self.lm_head.forward(output), hidden
 
 
 __all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]

@@ -14,6 +14,8 @@ exec "$VENV/bin/ft" serve \
   --reasoning-effort medium \
   --speculative-tokens 4 \
   --max-running-requests 1 \
+  --kv-reserve-tokens 32768 \
+  --max-seq-len-override 32768 \
   --host 0.0.0.0 \
   --port 1234 \
   "$@"

@@ -21,6 +21,8 @@ class EngineConfig:
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_backend: str = "auto"
+    # Attached-model speculative depth. Zero disables speculative decoding.
+    speculative_tokens: int = 0
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
     nvfp4_backend: str = "triton"
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
@@ -91,7 +93,16 @@ class EngineConfig:
     def model_config(self) -> ModelConfig:
         spec = get_model_spec(self.hf_config.architectures[0])
         parse_config = _load_attr(spec.module, spec.parse_config)
-        return parse_config(self.hf_config)
+        config = parse_config(self.hf_config)
+        if not self.speculative_tokens:
+            return config
+        try:
+            enable = _load_attr(spec.module, "enable_mtp")
+        except AttributeError as exc:
+            raise ValueError(
+                f"{self.hf_config.architectures[0]} does not support attached MTP"
+            ) from exc
+        return enable(config, self.speculative_tokens)
 
     @property
     def max_seq_len(self) -> int:

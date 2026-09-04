@@ -109,6 +109,12 @@ class ParallelLMHead(VocabParallelEmbedding):
             x = x[indices].contiguous()
             del indices
 
+        return self.forward_all(x)
+
+    def forward_all(self, x: torch.Tensor) -> torch.Tensor:
+        """Project every input row, without prefill's last-token selection."""
+        bs = x.shape[0]
+
         module = self.tied_embedding or self
         logits = F.linear(x, module.weight, self.bias)
         if self.tp_size == 1:

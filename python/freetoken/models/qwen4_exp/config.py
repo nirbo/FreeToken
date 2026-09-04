@@ -312,7 +312,10 @@ def enable_mtp(config: ModelConfig, draft_tokens: int) -> ModelConfig:
         for group in config.attention_groups
     )
     return replace(
-        config, attention_groups=groups, num_speculative_tokens=draft_tokens
+        config,
+        attention_groups=groups,
+        num_speculative_tokens=draft_tokens,
+        single_stream_only=True,
     )
 
 

@@ -1445,9 +1445,8 @@ def _adjust_config(config: EngineConfig):
     expert_quant = getattr(model_config, "expert_quant", "none")
 
     if getattr(model_config, "num_speculative_tokens", 0):
-        # ponytail: MTP starts single-request/eager/no-prefix; add batched graphs and
-        # continuation-hidden prefix entries only after the real workload needs them.
-        override("cache_type", "naive")
+        # MTP orchestration is eager; the target-only decode graph cannot serve a
+        # proposal/verification round yet.
         override("cuda_graph_bs", [])
         override("cuda_graph_max_bs", 0)
 

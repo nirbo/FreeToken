@@ -162,6 +162,18 @@ def test_auto_qsa_sets_page_size_64(monkeypatch):
     assert config.page_size == 64
 
 
+def test_mtp_qsa_keeps_hybrid_prefix_cache(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("qsa", attention_backend="auto")
+    config.model_config.num_speculative_tokens = 2
+    config.model_config.single_stream_only = True
+    _adjust_config(config)
+    assert config.cache_type == "hybrid_radix"
+    assert config.cuda_graph_bs == []
+
+
 def test_qsa_coerces_explicit_page_size(monkeypatch):
     # Same policy as m3_sparse (page_sizes=(128,)): an unsupported explicit value is
     # coerced to the backend's page size with a warning, not rejected.

@@ -1101,7 +1101,7 @@ class Engine:
         target_batch.speculative = True  # causal prefill attention, on-demand MoE experts
         pool = self.linear_state_pool
         live_slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
-        rollback_slot = pool.num_slots - 1 if pool is not None else 0
+        rollback_slot = pool.padding_slot if pool is not None else 0
         if pool is not None:
             pool.copy_from(live_slot, rollback_slot)
         target_logits, target_hidden = self._target_forward(target_batch, all_logits=True)

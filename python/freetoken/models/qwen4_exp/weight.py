@@ -5,8 +5,10 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`iter_weights` -- every dense (non-expert) tensor, with the ``model.language_model.`` prefix stripped and fused where the model expects one buffer. See ``_FUSIONS``.
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
+* :func:`iter_mtp_weights` -- the optional MTP layer, keeping its dense/shared/routed NVFP4 tensors resident.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
+The normal target-model pass drops ``mtp.*``; it is loaded separately only when MTP is enabled.
+``model.visual.*`` is always dropped because this package serves the checkpoint text-only.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.models.loader import drop_page_cache, iter_weight_files
+from freetoken.models.loader import ShardReader, drop_page_cache, iter_weight_files
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
     load_nvfp4_expert_source_banks,
@@ -39,6 +41,10 @@ _EXPERT_KEY_RE = re.compile(
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
 )
 _EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
+_MTP_EXPERT_RE = re.compile(
+    r"^mtp\.layers\.0\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
+)
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_EXPERT_KEY_RE,
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
@@ -182,6 +188,106 @@ def iter_weights(
                 yield name, tensor
 
     assert not fuse_buf, f"Incomplete projection fusions: {sorted(fuse_buf)}"
+
+
+def _mtp_expert_banks(reader, config, device: torch.device):
+    """Load the single MTP layer's routed experts straight into resident NVFP4 banks."""
+    e, h, i = config.num_experts, config.hidden_size, config.moe_intermediate_size
+    fp8 = torch.float8_e4m3fn
+    banks = {
+        "gate_up_packed": torch.empty(e, 2 * i, h // 2, dtype=torch.uint8, device=device),
+        "gate_up_scale": torch.empty(e, 2 * i, h // 16, dtype=fp8, device=device),
+        "gate_up_global": torch.empty(e, 2 * i, dtype=torch.float16, device=device),
+        "down_packed": torch.empty(e, h, i // 2, dtype=torch.uint8, device=device),
+        "down_scale": torch.empty(e, h, i // 16, dtype=fp8, device=device),
+        "down_global": torch.empty(e, h, dtype=torch.float16, device=device),
+    }
+    for expert in range(e):
+        prefix = f"mtp.layers.0.mlp.experts.{expert}"
+        for proj, bank, rows in (
+            ("gate_proj", "gate_up", slice(0, i)),
+            ("up_proj", "gate_up", slice(i, 2 * i)),
+            ("down_proj", "down", slice(None)),
+        ):
+            base = f"{prefix}.{proj}"
+            banks[f"{bank}_packed"][expert, rows].copy_(reader.get_tensor(base + ".weight"))
+            banks[f"{bank}_scale"][expert, rows].copy_(
+                reader.get_tensor(base + ".weight_scale")
+            )
+            banks[f"{bank}_global"][expert, rows].copy_(
+                reader.get_tensor(base + ".weight_scale_2").to(torch.float16)
+            )
+    return banks
+
+
+def _mtp_nvfp4_projection(reader, base: str):
+    weight = reader.get_tensor(base + ".weight")
+    scale = reader.get_tensor(base + ".weight_scale")
+    global_scale = (
+        reader.get_tensor(base + ".weight_scale_2")
+        .reshape(1)
+        .to(torch.float16)
+        .expand(weight.shape[0])
+        .contiguous()
+    )
+    return weight, scale, global_scale
+
+
+def iter_mtp_weights(
+    model_path: str, device: torch.device, config
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield the published ModelOpt NVFP4 MTP head in FreeToken's resident layouts."""
+    if get_tp_info().size > 1:
+        raise NotImplementedError("qwen4_exp MTP supports TP=1 only")
+    reader = ShardReader(model_path, device)
+    fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
+    nvfp4_buf: dict[str, dict[str, tuple[torch.Tensor, ...]]] = {}
+    try:
+        names = {
+            name for file in reader.files() for name in reader.names_in(file) if name.startswith("mtp.")
+        }
+        if not any(_MTP_EXPERT_RE.match(name) for name in names):
+            raise ValueError(
+                "MTP requires per-expert ModelOpt NVFP4 weights; use the published NVFP4-MTP checkpoint"
+            )
+        for raw_name in sorted(names):
+            if ".mlp.experts." in raw_name or raw_name.endswith(_SCALE_SUFFIXES):
+                continue
+            if not raw_name.endswith(".weight"):
+                continue
+            base = raw_name[: -len(".weight")]
+            if ".mlp.shared_expert." in base and base + ".weight_scale_2" in names:
+                parts = _mtp_nvfp4_projection(reader, base)
+                if base.endswith((".gate_proj", ".up_proj")):
+                    prefix, role = base.rsplit(".", 1)
+                    slots = nvfp4_buf.setdefault(prefix, {})
+                    slots[role] = parts
+                    if set(slots) != {"gate_proj", "up_proj"}:
+                        continue
+                    merged = f"{prefix}.gate_up_proj"
+                    for suffix, idx in (("weight", 0), ("weight_scale", 1), ("weight_global", 2)):
+                        yield merged + "." + suffix, torch.cat(
+                            [slots["gate_proj"][idx], slots["up_proj"][idx]], dim=0
+                        )
+                    del nvfp4_buf[prefix]
+                else:
+                    yield base + ".weight", parts[0]
+                    yield base + ".weight_scale", parts[1]
+                    yield base + ".weight_global", parts[2]
+                continue
+            tensor = reader.get_tensor(raw_name)
+            fused = _try_fuse(raw_name, tensor, fuse_buf)
+            if fused is None:
+                yield raw_name, tensor
+            elif fused:
+                yield fused
+
+        assert not fuse_buf, f"Incomplete MTP projection fusions: {sorted(fuse_buf)}"
+        assert not nvfp4_buf, f"Incomplete MTP NVFP4 fusions: {sorted(nvfp4_buf)}"
+        for name, tensor in _mtp_expert_banks(reader, config, device).items():
+            yield f"mtp.layers.0.mlp.experts.{name}", tensor
+    finally:
+        reader.close()
 
 
 # ======================================================================================

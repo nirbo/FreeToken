@@ -77,6 +77,17 @@ class MoELayer(BaseOP):
             self.down_proj = torch.empty(n, h, i, dtype=FP8)
             self.down_scale_inv = torch.empty(n, h // blk, i // blk, dtype=torch.bfloat16)
             return
+        if self.weight_format == "nvfp4":
+            assert self.tp_size == 1, "resident NVFP4 experts support TP=1 only"
+            n, i, h = self.num_experts, self.intermediate_size, self.hidden_size
+            fp8 = torch.float8_e4m3fn
+            self.gate_up_packed = torch.empty(n, 2 * i, h // 2, dtype=torch.uint8)
+            self.gate_up_scale = torch.empty(n, 2 * i, h // 16, dtype=fp8)
+            self.gate_up_global = torch.empty(n, 2 * i, dtype=torch.float16)
+            self.down_packed = torch.empty(n, h, i // 2, dtype=torch.uint8)
+            self.down_scale = torch.empty(n, h, i // 16, dtype=fp8)
+            self.down_global = torch.empty(n, h, dtype=torch.float16)
+            return
         assert self.weight_format == "bf16", (
             f"no resident expert allocation for weight_format {self.weight_format!r}"
         )
@@ -121,6 +132,37 @@ class MoELayer(BaseOP):
     ) -> torch.Tensor:
         """Kernel dispatch on ``self.weight_format`` -- the resident mirror of
         ``OffloadMoELayer._expert_gemm``'s ``cache.quant_format`` dispatch."""
+        if self.weight_format == "nvfp4":
+            banks = (
+                self.gate_up_packed,
+                self.gate_up_scale,
+                self.gate_up_global,
+                self.down_packed,
+                self.down_scale,
+                self.down_global,
+            )
+            if get_global_ctx().batch.is_prefill:
+                from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+
+                return fused_experts_nvfp4(
+                    hidden_states,
+                    *banks,
+                    topk_weights,
+                    topk_ids,
+                    self.num_experts,
+                    self.activation,
+                    self.apply_router_weight_on_input,
+                )
+            from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin
+
+            return fused_experts_decode_nvfp4_marlin(
+                hidden_states,
+                *banks,
+                topk_weights,
+                topk_ids,
+                self.activation,
+                self.apply_router_weight_on_input,
+            )
         if self.weight_format == "fp8_block":
             # Prefill dequantizes the layer's experts to bf16 and runs the bf16
             # grouped GEMM; decode dequantizes only the routed rows.

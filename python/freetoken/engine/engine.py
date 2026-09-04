@@ -1112,20 +1112,16 @@ class Engine:
         if accepted < depth:
             if pool is not None:
                 pool.copy_from(rollback_slot, live_slot)
+            # Keep only the verifier ring rows belonging to the licensed prefix.
+            ring_rows = batch.positions[: accepted + 1].long() % ring_before.shape[1]
             for slot in range(ring_before.shape[0] - 1):
-                self.kv_cache.pending_ring(slot)[req.table_idx].copy_(ring_before[slot])
-            replay = self._mtp_batch(
-                req,
-                verify_ids[: accepted + 1],
-                batch.positions[: accepted + 1],
-                batch.out_loc[: accepted + 1],
-                cached_len=base,
-                phase="prefill",
-                host_tokens=True,
-            )
-            replay.speculative = True
-            with self.ctx.forward_batch(replay), self.model.forward_host_ctx(replay, False):
-                self.model.model.forward(replay.input_ids, replay)
+                ring = self.kv_cache.pending_ring(slot)[req.table_idx]
+                accepted_rows = ring.index_select(0, ring_rows).clone()
+                ring.copy_(ring_before[slot])
+                ring.index_copy_(0, ring_rows, accepted_rows)
+            self.model.model.restore_speculative_state(accepted + 1)
+        else:
+            self.model.model.restore_speculative_state(None)
 
         # Drop provisional drafter rows, then align only the licensed target path.
         mtp_slot = ring_before.shape[0] - 1

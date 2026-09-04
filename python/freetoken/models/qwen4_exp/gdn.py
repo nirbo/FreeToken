@@ -113,6 +113,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         self.out_proj = make_replicated_quant(
             expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
         )
+        self._speculative_state = None
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()
@@ -207,6 +208,8 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             g, beta = self._gate_params(a, b)
             g = g.reshape(1, total, self.num_v_heads)
             beta = beta.float().reshape(1, total, self.num_v_heads)
+            if getattr(batch, "speculative", False):
+                self._speculative_state = (conv_in, mixed, g, beta, fla)
             # The chunk kernel reads + writes back initial_state[cache_indices] in place;
             # fresh sequences (cached_len==0) must start from a zeroed slot.
             if fla.fresh_state_indices is not None:
@@ -228,6 +231,36 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         z = z.reshape(-1, self.head_v_dim)
         out = self.norm.forward(core_out, z).reshape(total, -1)
         return self.out_proj.forward(out)
+
+    def restore_speculative_state(self, token_count: int | None) -> None:
+        """Rebuild a rejected verifier prefix from its cached recurrence inputs."""
+        saved, self._speculative_state = self._speculative_state, None
+        if token_count is None:
+            return
+        assert saved is not None
+        conv_in, mixed, g, beta, fla = saved
+        assert fla.cache_indices.numel() == 1
+        pool = get_global_ctx().linear_state_pool
+        li = pool.local_index(self.layer_id)
+        conv = pool.conv_states[li]
+        state = conv.index_select(0, fla.cache_indices)
+        history = torch.cat((state, conv_in[:token_count].T.unsqueeze(0)), dim=-1)
+        conv.index_copy_(
+            0, fla.cache_indices.long(), history[..., -state.shape[-1] :].to(conv.dtype)
+        )
+
+        qf, kf, vf = torch.split(
+            mixed[:token_count], [self.key_dim, self.key_dim, self.value_dim], dim=-1
+        )
+        q = qf.reshape(1, token_count, self.num_k_heads, self.head_k_dim)
+        k = kf.reshape(1, token_count, self.num_k_heads, self.head_k_dim)
+        v = vf.reshape(1, token_count, self.num_v_heads, self.head_v_dim)
+        cu = fla.cu_seqlens.new_tensor([0, token_count])
+        gdn_prefill_chunk_fla(
+            q, k, v, g[:, :token_count], beta[:, :token_count],
+            state_source=pool.recurrent_states[li], indices=fla.cache_indices,
+            cu_seqlens=cu, scale=self.head_k_dim ** -0.5,
+        )
 
 
 __all__ = ["Qwen4ExpGatedDeltaNet"]

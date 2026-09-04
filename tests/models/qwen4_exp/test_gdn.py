@@ -161,6 +161,46 @@ def test_chunk_and_recurrent_rules_agree():
     )
 
 
+def test_speculative_state_restore_matches_prefix_forward():
+    op, _ = _make_layer(3, seed=5)
+    ctx = _ctx(3)
+    pool = ctx.linear_state_pool
+    pool.conv_states.normal_()
+    pool.recurrent_states.normal_()
+    initial_conv = pool.conv_states.clone()
+    initial_recurrent = pool.recurrent_states.clone()
+    hidden = torch.randn(3, HIDDEN, device=DEV, dtype=torch.bfloat16)
+
+    req = Req(
+        input_ids=torch.zeros(8, dtype=torch.int32), table_idx=1, cached_len=5,
+        output_len=1, uid=0, sampling_params=SamplingParams(), cache_handle=None,
+    )
+    batch = Batch(reqs=[req], phase="prefill")
+    batch.padded_reqs = [req]
+    batch.speculative = True
+    with ctx.forward_batch(batch):
+        op.forward(hidden)
+        pool.conv_states.copy_(initial_conv)
+        pool.recurrent_states.copy_(initial_recurrent)
+        op.restore_speculative_state(2)
+    replay_conv = pool.conv_states.clone()
+    replay_recurrent = pool.recurrent_states.clone()
+
+    pool.conv_states.copy_(initial_conv)
+    pool.recurrent_states.copy_(initial_recurrent)
+    prefix_req = Req(
+        input_ids=torch.zeros(7, dtype=torch.int32), table_idx=1, cached_len=5,
+        output_len=1, uid=1, sampling_params=SamplingParams(), cache_handle=None,
+    )
+    prefix = Batch(reqs=[prefix_req], phase="prefill")
+    prefix.padded_reqs = [prefix_req]
+    with ctx.forward_batch(prefix):
+        op.forward(hidden[:2])
+
+    torch.testing.assert_close(pool.conv_states, replay_conv)
+    torch.testing.assert_close(pool.recurrent_states, replay_recurrent)
+
+
 def test_output_gate_comes_from_the_config():
     """The gate activation is the group config's string, not a hardcoded silu. Both gates track
     their own reference, and the two are far apart -- so a stuck activation cannot pass."""

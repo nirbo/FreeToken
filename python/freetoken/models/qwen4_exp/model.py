@@ -127,6 +127,14 @@ class Qwen4ExpModel(BaseOP):
         output = self.hyper_connection_mixer.mix(hidden)[0]
         return (output, hidden) if return_multistream else output
 
+    def restore_speculative_state(self, token_count: int | None) -> None:
+        """Restore stateful target layers without replaying the full decoder."""
+        for layer in self.layers.op_list:
+            if layer.ple is not None:
+                layer.ple.restore_speculative_state(token_count)
+            if layer._is_linear:
+                layer.linear_attn.restore_speculative_state(token_count)
+
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:

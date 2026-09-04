@@ -489,10 +489,19 @@ def parse_args(
     parser.add_argument(
         "--ple-backend",
         default=ServerArgs.ple_backend,
-        choices=["pinned", "disk"],
+        choices=["auto", "pinned", "disk"],
         help=(
-            "Where a PLE n-gram table lives. 'disk' (default) reads rows straight from the "
-            "checkpoint files; 'pinned' preloads the whole table into page-locked host RAM."
+            "Where a PLE n-gram table lives. 'auto' (default) prefers page-locked RAM when "
+            "the PLE and expert banks safely fit, otherwise reads selected rows from disk."
+        ),
+    )
+
+    parser.add_argument(
+        "--ple-quant-path",
+        default=ServerArgs.ple_quant_path,
+        help=(
+            "Local NVFP4 PLE sidecar directory (META.json + shards), or its parent. "
+            "By default a compatible ples_nvfp4 directory is discovered beside the model."
         ),
     )
 

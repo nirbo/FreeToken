@@ -25,8 +25,10 @@ class EngineConfig:
     speculative_tokens: int = 0
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
     nvfp4_backend: str = "triton"
-    # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
-    ple_backend: str = "disk"
+    # PLE residency: auto prefers RAM when the table safely fits beside expert banks.
+    ple_backend: str = "auto"
+    # Optional local NVFP4 PLE sidecar; None discovers ``ples_nvfp4`` beside/inside the model.
+    ple_quant_path: str | None = None
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the

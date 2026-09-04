@@ -21,12 +21,14 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
-from freetoken.utils import nvtx_annotate
+from freetoken.utils import init_logger, nvtx_annotate
 
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -178,35 +180,73 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
             return 0
 
-        if engine_config.ple_backend == "disk":
-            from freetoken.utils import download_hf_weight
+        from freetoken.utils import download_hf_weight
+        from .ple_disk import DiskRowTable, resolve_row_source
+        from .ple_nvfp4 import (
+            Nvfp4DiskRowTable, PinnedNVFP4Table, host_memory_info, load_nvfp4_table,
+            prefer_pinned_ple, resolve_nvfp4_source,
+        )
 
-            from .ple_disk import DiskRowTable, resolve_row_source
-
-            folder = download_hf_weight(engine_config.model_path)
-            # one WAIT node per captured graph: the flag protocol supports a single consume
-            assert len(ple_layers) == 1, "disk PLE backend expects exactly one PLE layer"
-            emb, args = ple_layers[0].ple_embedding, ple_layers[0].args
-            # hash with the state-dict-loaded constants, the same source the pinned path reads
-            constants = {
-                "num_ngram_heads": args.num_ngram_heads,
-                "layer_multipliers": emb.layer_multipliers.tolist(),
-                "per_head_vocab_sizes": emb.ngram_heads_vocab_sizes.tolist(),
-                "per_head_offsets": emb.ngram_heads_offsets.tolist(),
-                "eos_token_id": args.ngram_boundary_token_id,
-            }
-            disk_table = DiskRowTable(
-                resolve_row_source(folder),
-                constants,
-                max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
-                max_extend_tokens=engine_config.max_extend_tokens,
+        folder = download_hf_weight(engine_config.model_path)
+        assert len(ple_layers) == 1, "PLE backend expects exactly one PLE layer"
+        emb, args = ple_layers[0].ple_embedding, ple_layers[0].args
+        constants = {
+            "num_ngram_heads": args.num_ngram_heads,
+            "layer_multipliers": emb.layer_multipliers.tolist(),
+            "per_head_vocab_sizes": emb.ngram_heads_vocab_sizes.tolist(),
+            "per_head_offsets": emb.ngram_heads_offsets.tolist(),
+            "eos_token_id": args.ngram_boundary_token_id,
+        }
+        expected_rows = max(o + s for o, s in zip(
+            constants["per_head_offsets"], constants["per_head_vocab_sizes"]
+        ))
+        nvfp4 = resolve_nvfp4_source(
+            folder, getattr(engine_config, "ple_quant_path", None),
+            expected_rows=expected_rows, expected_width=args.ngram_head_dim,
+        )
+        row_source = nvfp4.packed if nvfp4 else resolve_row_source(folder)
+        ple_bytes = nvfp4.nbytes if nvfp4 else row_source.total_rows * row_source.row_bytes
+        backend = engine_config.ple_backend
+        if backend == "auto":
+            from freetoken.moe.expert_banks import bank_bytes_estimate
+            expert_bytes = bank_bytes_estimate(self._config) or 0
+            memory = host_memory_info()
+            backend = "pinned" if prefer_pinned_ple(ple_bytes, expert_bytes, memory) else "disk"
+            detail = "host memory unavailable" if memory is None else (
+                f"{memory[1] / 2**30:.1f} GiB available; table {ple_bytes / 2**30:.1f} GiB, "
+                f"experts {expert_bytes / 2**30:.1f} GiB"
             )
+            logger.info_rank0(f"PLE auto: {detail} -> {backend}")
+
+        def attach_disk() -> None:
+            table_cls, source = ((Nvfp4DiskRowTable, nvfp4) if nvfp4
+                                 else (DiskRowTable, row_source))
+            disk_table = table_cls(source, constants,
+                max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
+                max_extend_tokens=engine_config.max_extend_tokens)
             self._ple_table = disk_table
             for ple in ple_layers:
                 ple.ple_embedding.attach_table(disk_table)
-            # engine enters this around every dispatch; the graph itself never waits on the disk
             self.forward_host_ctx = disk_table.forward_host_ctx
+
+        if backend == "disk":
+            attach_disk()
             return 0
+
+        if nvfp4:
+            try:
+                table = load_nvfp4_table(nvfp4)
+            except (OSError, RuntimeError) as exc:
+                if engine_config.ple_backend != "auto":
+                    raise
+                logger.warning_rank0(f"PLE RAM load failed ({exc}); falling back to disk")
+                attach_disk()
+                return 0
+            self._ple_table = table
+            for ple in ple_layers:
+                ple.ple_embedding.attach_table(
+                    PinnedNVFP4Table(table.packed, table.scales, table.scale_2))
+            return table.bank.nbytes
 
         from .weight import load_ple_table
 

@@ -969,10 +969,15 @@ class Engine:
         *,
         cached_len: int,
         phase: str,
+        host_tokens: bool = False,
     ) -> Batch:
         proxy = copy(req)
         proxy.cached_len = cached_len
         proxy.device_len = cached_len + input_ids.numel()
+        if host_tokens:
+            # Disk PLE hashes from Req.input_ids; speculative drafts otherwise exist only
+            # in batch.input_ids on the GPU, leaving verification rows stale after the anchor.
+            proxy.input_ids = torch.cat((req.input_ids[:cached_len], input_ids.to("cpu")))
         batch = Batch(reqs=[proxy], phase=phase)  # type: ignore[arg-type]
         batch.padded_reqs = batch.reqs
         batch.input_ids = input_ids
@@ -1091,6 +1096,7 @@ class Engine:
             batch.out_loc[: depth + 1],
             cached_len=base,
             phase="prefill",
+            host_tokens=True,
         )
         pool = self.linear_state_pool
         live_slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
@@ -1114,6 +1120,7 @@ class Engine:
                 batch.out_loc[: accepted + 1],
                 cached_len=base,
                 phase="prefill",
+                host_tokens=True,
             )
             with self.ctx.forward_batch(replay), self.model.forward_host_ctx(replay, False):
                 self.model.model.forward(replay.input_ids, replay)

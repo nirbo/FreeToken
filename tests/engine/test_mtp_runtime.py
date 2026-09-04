@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from freetoken.engine.engine import Engine, _greedy_accept
@@ -23,6 +24,23 @@ def test_mtp_round_math_and_budget_cap():
     assert _speculative_depth(req, 5) == 2
     req.sampling_params.is_greedy = False
     assert _speculative_depth(req, 5) == 0
+
+
+def test_pinned_ple_mtp_uses_overlap(monkeypatch):
+    from freetoken.env import ENV
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = object.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(
+        model_config=SimpleNamespace(num_speculative_tokens=4), ple_backend="pinned"
+    )
+    scheduler.stream = object()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: scheduler.stream)
+    monkeypatch.setattr(ENV.DISABLE_OVERLAP_SCHEDULING, "value", False)
+    scheduler.overlap_loop = lambda _: (_ for _ in ()).throw(RuntimeError("overlap"))
+
+    with pytest.raises(RuntimeError, match="overlap"):
+        scheduler.run_forever()
 
 
 def test_mtp_verification_materializes_drafts_for_disk_ple():

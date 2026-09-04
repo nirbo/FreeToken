@@ -31,8 +31,15 @@ def _prefill_batch(new_tokens, cached_tokens, n_seqs):
     )
 
 
-def _decode_batch(n):
-    return SimpleNamespace(is_prefill=False, is_decode=True, reqs=[_req(1, 0) for _ in range(n)])
+def _decode_batch(n, *, depth=0, accepted=0):
+    return SimpleNamespace(
+        is_prefill=False,
+        is_decode=True,
+        reqs=[_req(1, 0) for _ in range(n)],
+        speculative=bool(depth),
+        speculative_depth=depth,
+        generated_tokens=accepted + 1 if depth else 0,
+    )
 
 
 def test_prefill_line_reports_tokens_and_throughput():
@@ -135,6 +142,25 @@ def test_decode_counter_resets_each_interval():
     rep.report_batch(_decode_batch(3), running_reqs=3, queue_reqs=0,
                      kv_used_pages=1, kv_total_pages=10, page_size=1)
     assert "gen throughput (token/s): 3.00" in logs[-1]
+
+
+def test_decode_line_reports_and_resets_mtp_acceptance():
+    rep, logs, clock = _reporter(interval=2)
+    clock["t"] = 1.0
+    rep.report_batch(_decode_batch(1, depth=3, accepted=2), running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=10, page_size=1)
+    clock["t"] = 2.0
+    rep.report_batch(_decode_batch(1, depth=3, accepted=1), running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=10, page_size=1)
+    assert "mtp acceptance: 0.50" in logs[-1]
+
+    clock["t"] = 3.0
+    rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=10, page_size=1)
+    clock["t"] = 4.0
+    rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=10, page_size=1)
+    assert "mtp acceptance" not in logs[-1]
 
 
 def test_zero_gap_and_zero_total_are_guarded():

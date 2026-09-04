@@ -213,8 +213,8 @@ mkdir -p "$FT_HOME"
 # own index (cubin arch-agnostic; jit-cache per-cuNNN). Large (~2 GiB) but downloaded once.
 INSTALL_WHEELS=(
   "${WHEEL}[accel]"
-  flashinfer-cubin
-  flashinfer-jit-cache
+  flashinfer-cubin==0.6.18
+  flashinfer-jit-cache==0.6.18+cu130
   "$KERNEL_CACHE_WHEEL"
 )
 CU_INDEX_ARGS=(

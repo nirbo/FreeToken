@@ -285,7 +285,11 @@ def _linear_pool_num_slots(config) -> int:
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
     ratio = config.linear_state_cache_ratio
-    n_cache = max(4, int(ratio * mr))
+    # A single-stream model has no overlapped batch competing for cached snapshots; honor
+    # its ratio directly instead of reserving the multi-request floor of four.
+    single_stream = getattr(getattr(config, "model_config", None), "single_stream_only", False)
+    cache_floor = 1 if single_stream else 4
+    n_cache = max(cache_floor, int(ratio * mr))
     return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
 
 

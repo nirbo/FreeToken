@@ -158,6 +158,19 @@ def test_empty_effort_is_treated_as_absent():
     assert state.sent.chat_template_kwargs == {}
 
 
+def test_server_default_effort_applies_only_when_request_omits_it():
+    for request, expected in (
+        (chat_request(), {**ON, "reasoning_effort": "medium"}),
+        (chat_request(reasoning_effort="low"), {**ON, "reasoning_effort": "low"}),
+        (chat_request(reasoning_effort="none"), OFF),
+    ):
+        state = FakeState(reasoning_parser="qwen3")
+        state.config.default_reasoning_effort = "medium"
+        response = run(handle_chat_completion(request, None, state, {}))
+        assert not isinstance(response, JSONResponse)
+        assert state.sent.chat_template_kwargs == expected
+
+
 def test_foreign_thinking_shapes_stay_ignored():
     # extra="allow" swallowed any thinking shape before the field existed;
     # a bare string, a bool, or a typeless dict must keep working unchanged.
@@ -225,6 +238,9 @@ def test_v1_models_publishes_the_probed_efforts():
     card = _models_payload(state)
     assert card["supported_reasoning_efforts"] == ["xhigh", "medium", "low"]
     assert card["default_reasoning_effort"] == "xhigh"
+
+    state.config.default_reasoning_effort = "medium"
+    assert _models_payload(state)["default_reasoning_effort"] == "medium"
 
 
 def test_v1_models_omits_efforts_without_a_frontend_tokenizer():

@@ -258,9 +258,19 @@ def split_tool_lists(
 # --------------------------------------------------------------------------- #
 # The primitive: submit + generate (consume a GenSpec, drive the engine waist).
 # --------------------------------------------------------------------------- #
+def _server_reasoning_kwargs(state: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    effort = getattr(state.config, "default_reasoning_effort", None)
+    if not effort:
+        return kwargs
+    from .model_meta import effort_toggle_kwargs
+
+    return effort_toggle_kwargs(effort, kwargs)
+
+
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
+    spec.chat_template_kwargs = _server_reasoning_kwargs(state, spec.chat_template_kwargs)
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
@@ -296,7 +306,7 @@ async def count_prompt_tokens(
         uid=0,
         text=messages,
         sampling_params=SamplingParams(),
-        chat_template_kwargs=chat_template_kwargs,
+        chat_template_kwargs=_server_reasoning_kwargs(state, chat_template_kwargs),
         tools=tools,
     )
     manager = await asyncio.to_thread(state.frontend_tokenizer)  # init failure -> server fault
@@ -316,6 +326,7 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
     frontend tokenizer, or one that fails to *initialize*, skips validation
     rather than blocking the generation path.
     """
+    spec.chat_template_kwargs = _server_reasoning_kwargs(state, spec.chat_template_kwargs)
     build = getattr(state, "frontend_tokenizer", None)
     if build is None:
         return None

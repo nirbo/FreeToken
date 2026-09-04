@@ -26,6 +26,8 @@ class ServerArgs(SchedulerConfig):
     # Reasoning parser that splits <think> reasoning from content for OpenAI
     # responses. None disables it (default for models without a reasoning protocol).
     reasoning_parser: str | None = None
+    # Fallback reasoning effort for chat requests that do not choose one.
+    default_reasoning_effort: str | None = None
     # "model": fill unspecified request sampling params from generation_config.json
     # (temperature/top_k/top_p), like sglang. "none": use framework defaults only.
     sampling_defaults: str = "model"
@@ -473,6 +475,17 @@ def parse_args(
             "<think> for qwen3/glm/minimax, <mm:think> for minimax-m3, ATEM to=self "
             "channels for muse-glimmer, gemma thought, dsv4); 'off' disables it."
         ),
+    )
+
+    from freetoken.tokenizer.effort import KNOWN_REASONING_EFFORTS
+
+    parser.add_argument(
+        "--reasoning-effort",
+        "--default-reasoning-effort",
+        dest="default_reasoning_effort",
+        choices=KNOWN_REASONING_EFFORTS,
+        default=ServerArgs.default_reasoning_effort,
+        help="Default reasoning effort when a request omits it; explicit request values win.",
     )
 
     parser.add_argument(

@@ -39,3 +39,41 @@ def test_mtp_verification_materializes_drafts_for_disk_ple():
         host_tokens=True,
     )
     assert batch.reqs[0].input_ids.tolist() == [10, 20, 30, 40]
+
+
+def test_speculative_prefill_uses_decode_moe_path(monkeypatch):
+    from freetoken.layers.moe import OffloadMoELayer
+
+    layer = object.__new__(OffloadMoELayer)
+    layer.tp_size = 1
+    calls = []
+    monkeypatch.setattr(
+        "freetoken.layers.moe.get_global_ctx",
+        lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=True, speculative=True)),
+    )
+    monkeypatch.setattr(
+        layer, "decode_forward", lambda hidden, router: calls.append("decode") or hidden
+    )
+    monkeypatch.setattr(
+        layer, "prefill_forward", lambda hidden, router: calls.append("prefill") or hidden
+    )
+
+    hidden = torch.zeros(2, 3)
+    assert layer.forward(hidden) is hidden
+    assert calls == ["decode"]
+
+
+def test_rejected_speculative_pages_return_to_free_list():
+    from freetoken.scheduler.cache import CacheManager
+
+    manager = object.__new__(CacheManager)
+    manager.page_size = 64
+    manager.page_table = torch.arange(256, dtype=torch.int32).view(1, -1)
+    manager.free_slots = torch.empty(0, dtype=torch.int32)
+    manager.swa_pool = None
+    manager.swa_paged = False
+    req = SimpleNamespace(table_idx=0, cached_len=128, device_len=129)
+
+    manager.free_speculative_tail(req, allocated_len=130)
+
+    assert manager.free_slots.tolist() == [128]

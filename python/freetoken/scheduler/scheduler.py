@@ -919,6 +919,9 @@ class Scheduler(SchedulerIOMixin):
         forward_output = self.engine.forward_batch(batch, sample_args)
         if batch.speculative:
             req = batch.reqs[0]
+            self.cache_manager.free_speculative_tail(
+                req, batch.speculative_output_start + batch.speculative_depth
+            )
             end = batch.speculative_output_start + forward_output.next_tokens_gpu.numel()
             self.token_pool[
                 req.table_idx, batch.speculative_output_start : end

@@ -281,6 +281,18 @@ class CacheManager:
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
+    def free_speculative_tail(self, req: Req, allocated_len: int) -> None:
+        """Return whole pages reserved past the verifier's accepted frontier."""
+        # device_len includes the sampled correction, whose KV does not exist until
+        # the next forward; only target-consumed tokens through cached_len own pages.
+        start = div_ceil(req.cached_len, self.page_size) * self.page_size
+        end = div_ceil(allocated_len, self.page_size) * self.page_size
+        if end > start:
+            tail = self.page_table[req.table_idx, start:end]
+            if self.swa_paged:
+                self._free_swa(tail)
+            self._free(tail)
+
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)

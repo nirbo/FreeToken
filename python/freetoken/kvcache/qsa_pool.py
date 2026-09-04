@@ -162,7 +162,11 @@ class QSAKVCache(MHAKVCache):
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
-                fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio) + 1)
+                ring = cls.ring_capacity_for(
+                    spec.index_ratio,
+                    getattr(config.model_config, "num_speculative_tokens", 0),
+                )
+                fixed += num_req_slots * row * (ring + 1)
         return per_token * config.page_size, fixed, config.page_size, 0
 
     def unit_bytes(self) -> tuple[int, int]:

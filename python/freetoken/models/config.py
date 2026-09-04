@@ -348,6 +348,8 @@ class ModelConfig:
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()
+    # Optional attached drafter depth. Zero keeps the model and weight path unchanged.
+    num_speculative_tokens: int = 0
 
     @property
     def is_moe(self) -> bool:

@@ -471,6 +471,7 @@ class Engine:
                 config.model_path,
                 self.device,
                 include_moe_experts=not is_offload_moe_backend(config.moe_backend),
+                include_mtp=bool(config.model_config.num_speculative_tokens),
             ),
             device=self.device,
         )

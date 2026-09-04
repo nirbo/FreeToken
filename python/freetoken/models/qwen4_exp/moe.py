@@ -43,4 +43,15 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
 
 
-__all__ = ["Qwen4ExpMoE"]
+class Qwen4ExpMTPMoE(Qwen4ExpMoE):
+    """The MTP layer keeps both its routed and shared ModelOpt NVFP4 experts resident."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        resident = replace(
+            config, moe_backend="fused", expert_quant="none", dense_quant="nvfp4"
+        )
+        super().__init__(resident)
+        self.experts = make_moe_layer(resident, weight_format="nvfp4")
+
+
+__all__ = ["Qwen4ExpMTPMoE", "Qwen4ExpMoE"]

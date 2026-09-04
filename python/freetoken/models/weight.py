@@ -225,6 +225,7 @@ def load_weight(
     device: torch.device,
     *,
     include_moe_experts: bool = True,
+    include_mtp: bool = False,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     # FTW checkpoint: dense weights are stored post-iter_weights, so we replay them
     # model-agnostically instead of re-running the per-model reader. Which tensors exist is
@@ -254,6 +255,11 @@ def load_weight(
         include_moe_experts=include_moe_experts,
         include_non_moe=True,
     )
+    if include_mtp:
+        iter_mtp = _model_override(spec, "iter_mtp_weights")
+        if iter_mtp is None:
+            raise ValueError(f"{_config.architectures[0]} does not provide MTP weights")
+        yield from iter_mtp(model_path, device, _config)
 
 
 def load_moe_expert_sources(

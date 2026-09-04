@@ -191,9 +191,10 @@ def create_kvcache_pool(
         spec = kv_specs[0]
         if num_req_slots is None:
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
+        speculative = getattr(model_config, "num_speculative_tokens", 0)
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            num_layers=model_config.num_layers + bool(speculative),
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -203,6 +204,9 @@ def create_kvcache_pool(
             num_index_layers=spec.num_index_layers,
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
+            ring_capacity=QSAKVCache.ring_capacity_for(
+                spec.index_ratio, speculative
+            ),
             layer_ids=spec.layer_ids,
         )
 

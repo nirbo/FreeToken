@@ -19,7 +19,7 @@ gathers rows over UVA, optionally started early on a side stream (``PLELayer.sta
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, List, Protocol, Sequence, Tuple
 
 import torch
@@ -567,6 +567,7 @@ class PLELayer(BaseOP):
             f"PLE conv history {self.state_len} exceeds CHUNK_SIZE {CHUNK_SIZE}"
         )
         self._pending: Tuple[PLEMetadata, torch.Tensor] | None = None
+        self._speculative_state: Tuple[PLEMetadata, torch.Tensor] | None = None
 
     def start_prefetch(self, batch: Batch, meta: PLEMetadata | None = None) -> None:
         """Hash this forward's n-grams and start the table gather on the side stream."""
@@ -605,10 +606,28 @@ class PLELayer(BaseOP):
         gated = (gate * value.unsqueeze(-2)).flatten(-2)
         states = conv_states if conv_states is not None else self._conv_state_slab(R)
         x = self.norm_conv.forward(gated)
+        if getattr(batch, "speculative", False):
+            self._speculative_state = (meta, x)
         fla = getattr(batch, "fla_metadata", None)
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
         return gated + self._short_conv(x, meta, states)
+
+    def restore_speculative_state(self, token_count: int | None) -> None:
+        """Rebuild a rejected verifier prefix from its cached conv input."""
+        saved, self._speculative_state = self._speculative_state, None
+        if token_count is None:
+            return
+        assert saved is not None and len(saved[0].seq_lens) == 1
+        meta, x = saved
+        replay = replace(
+            meta,
+            input_ids=meta.input_ids[:token_count],
+            cu_seqlens=meta.cu_seqlens.new_tensor([0, token_count]),
+            seq_lens=(token_count,),
+        )
+        self._prefill_conv(x[:token_count], replay, self._conv_state_slab(x))
+        commit_ngram_context(replay, None)
 
     def _write_track_snapshot(self, states: torch.Tensor, x: torch.Tensor, fla) -> None:
         """Copy the conv history at the GDN track boundary into the same donatable slot, so a radix

@@ -300,6 +300,49 @@ def test_prefill_conv_matches_reference():
     assert torch.allclose(got_states, ref_states, rtol=1e-5, atol=1e-6)
 
 
+def test_speculative_state_restore_matches_prefix_forward():
+    import freetoken.core as core
+    from freetoken.core import Context
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.models.qwen4_exp.config import PLE_CONV_STATE, PLE_NGRAM_STATE
+
+    config = _config()
+    layer = _make_layer(config)
+    core._GLOBAL_CTX = None
+    ctx = Context(page_size=64)
+    ctx.linear_state_pool = LinearStatePool(
+        config.linear_attention_group(), 3, torch.float32, torch.device("cpu"),
+        tp_size=1, slot_states=config.slot_states,
+    )
+    core.set_global_ctx(ctx)
+    conv = ctx.linear_state_pool.slot_state(PLE_CONV_STATE, layer.layer_id)
+    ngram = ctx.linear_state_pool.slot_state(PLE_NGRAM_STATE)
+    conv.normal_()
+    ngram[1] = torch.tensor([21, 22])
+    initial_conv, initial_ngram = conv.clone(), ngram.clone()
+    ids = [3, 4, 5]
+    meta = _meta([ids], [[21, 22]], slots=[1])
+    R = torch.randn(3, config.qwen4_args.ple_state_width)
+    batch = SimpleNamespace(speculative=True, fla_metadata=None)
+    with ctx.forward_batch(batch):
+        layer.forward(R, batch, meta=meta)
+        commit_ngram_context(meta, None)
+        conv.copy_(initial_conv)
+        ngram.copy_(initial_ngram)
+        layer.restore_speculative_state(2)
+    replay_conv, replay_ngram = conv.clone(), ngram.clone()
+
+    conv.copy_(initial_conv)
+    ngram.copy_(initial_ngram)
+    prefix = _meta([ids[:2]], [[21, 22]], slots=[1])
+    plain = SimpleNamespace(speculative=False, fla_metadata=None)
+    with ctx.forward_batch(plain):
+        layer.forward(R[:2], plain, meta=prefix)
+        commit_ngram_context(prefix, None)
+    torch.testing.assert_close(conv, replay_conv)
+    assert torch.equal(ngram, replay_ngram)
+
+
 def test_fresh_slots_read_a_zero_state():
     """A request marked fresh ignores whatever the pool slot still holds."""
     torch.manual_seed(13)

@@ -74,7 +74,13 @@ dev = ["pytest>=6.0"]
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
 # `freetoken[accel]` for the full native fast path.
-fi = ["flashinfer-python[cu13]>=0.6,<0.7"]
+# All three versions must match. The caches avoid runtime CUDA compilation for ops such
+# as stochastic sampling, which otherwise requires a complete system CUDA toolkit.
+fi = [
+    "flashinfer-python[cu13]==0.6.18",
+    "flashinfer-cubin==0.6.18",
+    "flashinfer-jit-cache==0.6.18+cu130",
+]
 # renamed from sgl-kernel at 0.4; still imports as `sgl_kernel`, so never co-install both
 sgl = ["sglang-kernel==0.4.5"]
 accel = ["freetoken[fi,sgl]"]
@@ -92,6 +98,8 @@ accel = ["freetoken[fi,sgl]"]
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 sglang-kernel = { index = "sglang-cu130" }
+flashinfer-cubin = { index = "flashinfer" }
+flashinfer-jit-cache = { index = "flashinfer-cu130" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
@@ -101,6 +109,16 @@ explicit = true
 [[tool.uv.index]]
 name = "sglang-cu130"
 url = "https://docs.sglang.io/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer"
+url = "https://flashinfer.ai/whl"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
 explicit = true
 
 [tool.setuptools]
